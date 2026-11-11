@@ -1,0 +1,19 @@
+{
+  "name": "tug-of-war-live",
+  "version": "1.1.0",
+  "type": "module",
+  "description": "Friendly 3D food tug of war overlay for live streams (unofficial, not affiliated with TikTok)",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "cross-env DEMO_MODE=1 node server.js",
+    "test:auto": "cross-env DEMO_MODE=1 AUTO_DEMO=1 node server.js",
+    "sim": "node test/simulator.js"
+  },
+  "dependencies": {
+    "cross-env": "^7.0.3",
+    "express": "^4.19.2",
+    "tiktok-live-connector": "^2.0.0",
+    "ws": "^8.18.0"
+  }
+}
