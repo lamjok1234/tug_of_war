@@ -1,0 +1,5 @@
+node_modules
+daily.json
+daily.demo.json
+.env
+.DS_Store
