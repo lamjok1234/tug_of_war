@@ -485,7 +485,7 @@ function startDemo(){
     if(k===' '&&s.phase==='playing'){e.preventDefault();s.roundEndTime=Date.now()}
   });
 }
-if(params.has('demo')||location.protocol!=='http:')startDemo();else connect();
+if(params.has('demo')||(location.protocol!=='http:'&&location.protocol!=='https:'))startDemo();else connect();
 
 // ---------- loop ----------
 const clock=new THREE.Clock(),camLook=new THREE.Vector3(0,1.5,0);
