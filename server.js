@@ -1,6 +1,6 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import { TikTokLiveConnection, WebcastEvent } from 'tiktok-live-connector';
+import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -12,14 +12,23 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ============================================================
 const TIKTOK_USERNAME    = process.env.TIKTOK_USER || 'YOUR_TIKTOK_USERNAME';
 const PORT               = Number(process.env.PORT) || 8080;
-const ROUND_DURATION_MS  = 5 * 60 * 1000;
-const INTERMISSION_MS    = 10000;
+const ROUND_DURATION_MS  = (Number(process.env.ROUND_SECONDS) || 300) * 1000;   // default 5 min
+const INTERMISSION_MS    = (Number(process.env.BREAK_SECONDS) || 10) * 1000;      // break between rounds
 const PULLER_DURATION_MS = 4000;
 const CHAT_COOLDOWN_MS   = 1200;           // per-user spam guard for !food / !drink
 const MAX_PULLERS        = 40;
 
 const DEMO_MODE = process.env.DEMO_MODE === '1';
 const AUTO_DEMO = DEMO_MODE && process.env.AUTO_DEMO === '1';
+
+// PLATFORM: 'tiktok' (reads TikTok LIVE directly) | 'tango' | 'generic'.
+// For tango/generic there is no direct connection: events arrive via POST /event or the /operator panel.
+const PLATFORM    = (process.env.PLATFORM || 'tiktok').toLowerCase();
+const EVENT_TOKEN = process.env.EVENT_TOKEN || (DEMO_MODE ? 'demo' : '');
+const GIFT_SCALE  = Number(process.env.GIFT_SCALE) || 1;     // coins/diamonds → power for gifts not in GIFT_POWER_MAP
+// Gift-only boosts (free !food/!drink never get them): last seconds count double, trailing team gets a bonus.
+const RULES = { finalPushMs: 30000, finalMult: 2, comebackRatio: 0.25, comebackMult: 1.25 };
+const BROADCAST_MIN_MS = 100;                                  // at most 10 state updates per second
 
 // ============================================================
 // [2] DATA
@@ -95,6 +104,8 @@ let gameState = {
 };
 
 const viewerCountry = new Map();             // userId → country (sticky across rounds)
+const roundGifts = { A: new Map(), B: new Map() };   // user → gift power this round (for MVP crowns)
+const pendingGifts = [];                     // gifts sent during the break; credited when the next round starts
 const chatCooldown = new Map();              // userId → last command ts
 let nextRoundTimer = null;                   // single handle → no duplicate rounds
 const rand = (a) => a[Math.floor(Math.random() * a.length)];
@@ -123,7 +134,13 @@ function parseSide(cmd) {
   if (n === gameState.teamB.toLowerCase()) return 'B';
   return null;
 }
-function joinSide(userId, user, team) { viewerCountry.set(userId, countryOf(team)); join(team, user); }
+function joinSide(userId, user, team) {
+  viewerCountry.set(userId, countryOf(team));
+  if (viewerCountry.size > 5000) {                       // keep memory bounded on long streams
+    for (const k of viewerCountry.keys()) { viewerCountry.delete(k); if (viewerCountry.size <= 4000) break; }
+  }
+  join(team, user);
+}
 // Anyone who gifts or buys without picking a side is placed on the smaller team.
 function sideFor(userId, user) {
   return teamOf(userId) || (joinSide(userId, user, smallerSide()), teamOf(userId));
@@ -136,14 +153,14 @@ function sideFor(userId, user) {
 // Resets at local midnight and is saved to disk, so a server restart doesn't lose it.
 // DATA_DIR lets a host with a persistent volume (e.g. Railway: /data) keep the board across deploys.
 const DAILY_FILE = path.join(process.env.DATA_DIR || __dirname, DEMO_MODE ? 'daily.demo.json' : 'daily.json');
-const dayKey = () => new Date().toLocaleDateString('en-CA');          // YYYY-MM-DD, local time
+const dayKey = () => new Date().toLocaleDateString('en-CA', process.env.DAY_TZ ? { timeZone: process.env.DAY_TZ } : undefined);  // YYYY-MM-DD; set DAY_TZ e.g. Europe/Istanbul
 function loadDaily() {
-  try { const d = JSON.parse(fs.readFileSync(DAILY_FILE, 'utf8')); if (d.day === dayKey()) return d; } catch { /* first run */ }
-  return { day: dayKey(), stats: {} };
+  try { const d = JSON.parse(fs.readFileSync(DAILY_FILE, 'utf8')); if (d.day === dayKey()) { d.gifters ||= {}; return d; } } catch { /* first run */ }
+  return { day: dayKey(), stats: {}, gifters: {} };
 }
 let daily = loadDaily();
 function saveDaily() { try { fs.writeFileSync(DAILY_FILE, JSON.stringify(daily)); } catch (e) { console.warn('Could not save leaderboard:', e.message); } }
-function rollDay() { if (daily.day !== dayKey()) { daily = { day: dayKey(), stats: {} }; saveDaily(); } }
+function rollDay() { if (daily.day !== dayKey()) { daily = { day: dayKey(), stats: {}, gifters: {} }; saveDaily(); } }
 function record(country, result, power) {
   const st = (daily.stats[country] ||= { w: 0, l: 0, d: 0, pf: 0 });
   st[result]++; st.pf += power;
@@ -154,13 +171,21 @@ const leaderboard = () =>
     .sort((a, b) => b.pts - a.pts || b.w - a.w || b.pf - a.pf)
     .slice(0, 8);
 
+function recordGifter(user, power) {
+  daily.gifters[user] = (daily.gifters[user] || 0) + power;
+  const keys = Object.keys(daily.gifters);
+  if (keys.length > 1500) keys.sort((a, b) => daily.gifters[a] - daily.gifters[b]).slice(0, 300).forEach((k) => delete daily.gifters[k]);
+}
+const supporters = () => Object.entries(daily.gifters).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([user, power]) => ({ user, power }));
+const mvpOf = (team) => { let best = null; for (const [user, power] of roundGifts[team]) if (!best || power > best.power) best = { user, power }; return best; };
+
 const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const itemsFor = (c) => LOCAL_ITEMS[c] || { flag: '🏳️', foods: ['🍽 Food'], drinks: ['🥤 Drink'] };
 const countryOf = (team) => (team === 'A' ? gameState.teamA : gameState.teamB);
 
 function pushEvent(evt) {
   gameState.events.unshift({ id: uid(), ts: Date.now(), ...evt });
-  if (gameState.events.length > 10) gameState.events.pop();
+  if (gameState.events.length > 20) gameState.events.pop();
 }
 
 function addPuller(team, user) {
@@ -188,14 +213,27 @@ function buy(team, user, kind) {
   pushEvent({ kind, user, team, country: countryOf(team), item: rand(pool), power });
 }
 
+function giftMult(team) {
+  const mine = team === 'A' ? gameState.powerA : gameState.powerB;
+  const other = team === 'A' ? gameState.powerB : gameState.powerA;
+  let m = 1;
+  if (gameState.roundEndTime - Date.now() <= RULES.finalPushMs) m *= RULES.finalMult;
+  if (mine + other >= 100 && other - mine >= (mine + other) * RULES.comebackRatio) m *= RULES.comebackMult;
+  return m;
+}
+
 function gift(team, user, name, count = 1, diamonds = 0) {
   if (!gameState.roundActive) return;
+  count = Math.min(999, Math.max(1, Math.floor(count) || 1));
   const base = GIFT_POWER_MAP[name] || diamonds || 10;
-  const power = base * Math.max(1, count);
+  const mult = giftMult(team);
+  const power = Math.round(base * count * mult);
   const skin = skinFor(countryOf(team), name, base);
   addPower(team, power);
   addPuller(team, user);
-  pushEvent({ kind: 'gift', user, team, item: skin.name, icon: skin.icon, base: name, count, power, country: countryOf(team) });
+  roundGifts[team].set(user, (roundGifts[team].get(user) || 0) + power);
+  recordGifter(user, power);
+  pushEvent({ kind: 'gift', user, team, item: skin.name, icon: skin.icon, base: name, count, power, mult, country: countryOf(team) });
 }
 
 function getNextMatch(winner) {
@@ -226,8 +264,11 @@ function startRound(teamA, teamB) {
     events: [], pullersA: [], pullersB: [],
   };
   chatCooldown.clear();
+  roundGifts.A.clear(); roundGifts.B.clear();
   console.log(`🎮 New round: ${teamA} vs ${teamB}`);
   broadcast();
+  const queued = pendingGifts.splice(0);                 // gifts sent during the break still count
+  queued.forEach((g) => onGift(...g));
 }
 
 function endRound() {
@@ -244,6 +285,7 @@ function endRound() {
     const loser = winner === teamA ? teamB : teamA;
     const wp = winner === teamA ? powerA : powerB, lp = winner === teamA ? powerB : powerA;
     gameState.matchHistory.push({ winner, loser, powerA, powerB, timestamp: Date.now() });
+    if (gameState.matchHistory.length > 200) gameState.matchHistory.shift();
     record(winner, 'w', wp); record(loser, 'l', lp);
     console.log(`🏆 ${winner} wins vs ${loser} (${powerA}–${powerB})`);
   } else {
@@ -273,7 +315,8 @@ const app = express();
 const server = app.listen(PORT, () => console.log(`🌐 Overlay: http://localhost:${PORT}`));
 const wss = new WebSocketServer({ server });
 
-app.use(express.json());
+app.disable('x-powered-by');
+app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 function snapshot() {
@@ -283,6 +326,10 @@ function snapshot() {
     type: 'state',
     data: {
       ...gameState,
+      platform: PLATFORM,
+      rules: RULES,
+      mvp: { A: mvpOf('A'), B: mvpOf('B') },
+      supporters: supporters(),
       leaderboard: leaderboard(),
       serverTime: now,                       // lets clients correct clock skew
       pullersA: gameState.pullersA.filter((p) => p.expiresAt > now),
@@ -291,12 +338,26 @@ function snapshot() {
   });
 }
 
-function broadcast() {
-  const payload = snapshot();
-  wss.clients.forEach((c) => c.readyState === 1 && c.send(payload));
+let flushTimer = null, lastSend = 0;
+function flush() {
+  flushTimer = null;
+  lastSend = Date.now();
+  if (!wss.clients.size) return;
+  const payload = snapshot();                            // built once, sent to every overlay
+  wss.clients.forEach((c) => c.readyState === 1 && c.bufferedAmount < 1e6 && c.send(payload));
+}
+function broadcast() {                                   // coalesces bursts into ≤10 updates/second
+  if (flushTimer) return;
+  flushTimer = setTimeout(flush, Math.max(0, BROADCAST_MIN_MS - (Date.now() - lastSend)));
 }
 
-wss.on('connection', (ws) => ws.send(snapshot()));
+wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('error', () => {});
+  ws.send(snapshot());
+});
+setInterval(() => wss.clients.forEach((c) => { if (!c.isAlive) return c.terminate(); c.isAlive = false; c.ping(); }), 30000);
 
 // ============================================================
 // [6] TEST ENDPOINTS (DEMO_MODE=1 only)
@@ -327,44 +388,70 @@ if (DEMO_MODE) {
 }
 
 // ============================================================
-// [7] TIKTOK LIVE (live mode only)
+// [7] INPUT ADAPTERS — every platform ends up calling onChat / onGift
 // ============================================================
+function onChat(userId, user, text) {
+  const msg = String(text ?? '').trim().toLowerCase();
+  if (!userId || !msg.startsWith('!')) return;
+  const cmd = msg.slice(1).replace(/\s+/g, ' ').trim();
+
+  const side = parseSide(cmd);
+  if (side) {
+    if (teamOf(userId)) return;                         // already on a side that is playing
+    joinSide(userId, user, side === 'auto' ? smallerSide() : side);
+    return broadcast();
+  }
+
+  if (cmd !== 'food' && cmd !== 'drink') return;
+  const last = chatCooldown.get(userId) || 0;
+  if (Date.now() - last < CHAT_COOLDOWN_MS) return;
+  chatCooldown.set(userId, Date.now());
+  buy(sideFor(userId, user), user, cmd);
+  broadcast();
+}
+
+function onGift(userId, user, name, count = 1, value = 0) {
+  if (!userId) return;
+  if (!gameState.roundActive) { if (pendingGifts.length < 300) pendingGifts.push([userId, user, name, count, value]); return; }
+  gift(sideFor(userId, user), user, name || 'Gift', count, Math.round(value * GIFT_SCALE));
+  broadcast();
+}
+
+// ---- generic inbound API: bridges, bots or the operator panel POST here ----
+const safeEq = (a, b) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+if (EVENT_TOKEN) {
+  app.post('/event', (req, res) => {
+    const tok = String(req.get('x-event-token') || req.query.token || '');
+    if (!safeEq(tok, EVENT_TOKEN)) return res.status(401).json({ ok: false, error: 'bad token' });
+    const b = req.body || {};
+    const user = String(b.user || 'anon').slice(0, 40);
+    const userId = String(b.userId || user).slice(0, 60);
+    if (b.type === 'chat') onChat(userId, user, String(b.text || '').slice(0, 100));
+    else if (b.type === 'gift') onGift(userId, user, String(b.gift || 'Gift').slice(0, 40), clamp(Number(b.count) || 1, 1, 99), clamp(Number(b.value) || 0, 0, 100000));
+    else return res.status(400).json({ ok: false, error: 'type must be "chat" or "gift"' });
+    res.json({ ok: true });
+  });
+  app.get('/operator', (_req, res) => res.sendFile(path.join(__dirname, 'test', 'operator.html')));
+  console.log(`🎛  Operator panel: http://localhost:${PORT}/operator?token=<EVENT_TOKEN>   Event API: POST /event`);
+}
+
+// ---- TikTok adapter (PLATFORM=tiktok only; library is optional) ----
 let connection = null;
 
-function connectTikTok(attempt = 1) {
+async function connectTikTok(attempt = 1) {
+  let lib;
+  try { lib = await import('tiktok-live-connector'); }
+  catch { return console.error('tiktok-live-connector is not installed. Run: npm install tiktok-live-connector'); }
+  const { TikTokLiveConnection, WebcastEvent } = lib;
   connection = new TikTokLiveConnection(TIKTOK_USERNAME, { enableExtendedGiftInfo: true });
 
-  connection.on(WebcastEvent.CHAT, (event) => {
-    const user = event.user?.uniqueId || 'anon';
-    const userId = event.user?.userId;
-    const msg = (event.comment ?? event.content ?? '').trim().toLowerCase();
-    if (!userId || !msg.startsWith('!')) return;
-    const cmd = msg.slice(1).replace(/\s+/g, ' ').trim();
-
-    const side = parseSide(cmd);
-    if (side) {
-      if (teamOf(userId)) return;                       // already on a side that is playing
-      joinSide(userId, user, side === 'auto' ? smallerSide() : side);
-      return broadcast();
-    }
-
-    if (cmd !== 'food' && cmd !== 'drink') return;
-    const last = chatCooldown.get(userId) || 0;
-    if (Date.now() - last < CHAT_COOLDOWN_MS) return;
-    chatCooldown.set(userId, Date.now());
-    buy(sideFor(userId, user), user, cmd);
-    broadcast();
-  });
-
-  connection.on(WebcastEvent.GIFT, (event) => {
-    if (!event.gift) return;
+  connection.on(WebcastEvent.CHAT, (e) => onChat(e.user?.userId, e.user?.uniqueId || 'anon', e.comment ?? e.content));
+  connection.on(WebcastEvent.GIFT, (e) => {
+    if (!e.gift) return;
     // Streakable gifts fire many times mid-combo; only count the final tally.
-    if (event.giftType === 1 && !event.repeatEnd) return;
-    const userId = event.user?.userId;
-    if (!userId) return;
-    const user = event.user?.uniqueId || 'anon';
-    gift(sideFor(userId, user), user, event.gift.name || 'Gift', event.repeatCount || 1, event.gift.diamondCount || event.diamondCount || 1);
-    broadcast();
+    if (e.giftType === 1 && !e.repeatEnd) return;
+    onGift(e.user?.userId, e.user?.uniqueId || 'anon', e.gift.name, e.repeatCount || 1, e.gift.diamondCount || e.diamondCount || 1);
   });
 
   connection.on('disconnected', () => {
@@ -409,5 +496,14 @@ if (DEMO_MODE) {
     }, 900);
   }
 } else {
-  connectTikTok();
+  if (PLATFORM === 'tiktok') connectTikTok();
+  else console.log(`🔌 PLATFORM=${PLATFORM}: no direct chat/gift connection. Send events to POST /event or use /operator.`);
+}
+
+// ============================================================
+// [9] SAFETY NET
+// ============================================================
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => { console.log('Shutting down…'); saveDaily(); server.close(); process.exit(0); });
 }
