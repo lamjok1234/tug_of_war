@@ -22,13 +22,17 @@ const DEMO_MODE = process.env.DEMO_MODE === '1';
 const AUTO_DEMO = DEMO_MODE && process.env.AUTO_DEMO === '1';
 
 // PLATFORM: 'tiktok' (reads TikTok LIVE directly) | 'tango' | 'generic'.
-// For tango/generic there is no direct connection: events arrive via POST /event or the /operator panel.
+// For tango/generic there is no direct connection: events arrive via webhook or POST /event.
 const PLATFORM    = (process.env.PLATFORM || 'tiktok').toLowerCase();
 const EVENT_TOKEN = process.env.EVENT_TOKEN || (DEMO_MODE ? 'demo' : '');
 const GIFT_SCALE  = Number(process.env.GIFT_SCALE) || 1;     // coins/diamonds → power for gifts not in GIFT_POWER_MAP
 // Gift-only boosts (free !food/!drink never get them): last seconds count double, trailing team gets a bonus.
 const RULES = { finalPushMs: 30000, finalMult: 2, comebackRatio: 0.25, comebackMult: 1.25 };
 const BROADCAST_MIN_MS = 100;                                  // at most 10 state updates per second
+
+// Tango webhook signing secret (from tangoagent.io when you create the webhook)
+const TANGO_SIGNING_SECRET = process.env.TANGO_SIGNING_SECRET || '';
+const TANGO_MAX_SKEW_S     = 300;                              // reject webhooks older than 5 min (replay protection)
 
 // ============================================================
 // [2] DATA
@@ -147,7 +151,7 @@ function sideFor(userId, user) {
 }
 
 // ============================================================
-// [4] CORE GAME LOGIC (shared by TikTok handlers + test endpoints)
+// [4] CORE GAME LOGIC (shared by platform handlers + test endpoints)
 // ============================================================
 // ---- daily leaderboard: countries ranked by today's results (3 pts win, 1 draw) ----
 // Resets at local midnight and is saved to disk, so a server restart doesn't lose it.
@@ -316,6 +320,25 @@ const server = app.listen(PORT, () => console.log(`🌐 Overlay: http://localhos
 const wss = new WebSocketServer({ server });
 
 app.disable('x-powered-by');
+
+// ---- Tango raw-body capture + OPTIONS probe (must run BEFORE express.json) ----
+if (PLATFORM === 'tango') {
+  // Keep the raw Buffer for HMAC verification. Body-parser sets req._body=true,
+  // so the later express.json() will skip this request path.
+  app.use('/tango-hook', express.raw({ type: 'application/json', limit: '1mb' }));
+
+  // Tango validates the webhook URL with an OPTIONS request.
+  app.use((req, res, next) => {
+    if (req.method === 'OPTIONS' && req.path.startsWith('/tango-hook')) {
+      return res
+        .set('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        .set('Access-Control-Allow-Headers', 'Content-Type, TNG-Webhook-Signature')
+        .sendStatus(200);
+    }
+    next();
+  });
+}
+
 app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -436,6 +459,91 @@ if (EVENT_TOKEN) {
   console.log(`🎛  Operator panel: http://localhost:${PORT}/operator?token=<EVENT_TOKEN>   Event API: POST /event`);
 }
 
+// ---- Tango webhook adapter (PLATFORM=tango only) ----
+if (PLATFORM === 'tango') {
+  function verifyTangoSignature(rawBody, signatureHeader, secret) {
+    if (!secret) return true;                         // no secret configured → accept (dev only)
+    if (!signatureHeader) return false;
+
+    const parts = String(signatureHeader).split(',').map((s) => s.trim());
+    const t  = parts.find((p) => p.startsWith('t='))?.slice(2);
+    const v1 = parts.find((p) => p.startsWith('v1='))?.slice(3);
+
+    // Replay protection when a timestamp is supplied.
+    if (t) {
+      const now = Math.floor(Date.now() / 1000);
+      if (!Number.isFinite(Number(t)) || Math.abs(now - Number(t)) > TANGO_MAX_SKEW_S) return false;
+    }
+
+    // Signed payload is "<timestamp>.<rawBody>" when a timestamp exists; otherwise just rawBody.
+    const payload   = t ? `${t}.${rawBody}` : rawBody;
+    const candidate = v1 || signatureHeader;
+    const expected  = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+
+    try {
+      const a = Buffer.from(candidate, 'hex');
+      const b = Buffer.from(expected,  'hex');
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch { return false; }
+  }
+
+  function dispatchTangoEvent(evt) {
+    // Chat batch → one onChat() per message
+    if (evt.type === 'stream.chat.messages.received') {
+      const msgs = evt.data?.messages || [];
+      for (const m of msgs) {
+        if (m.systemMessage) continue;                // ignore platform/system messages
+        const userId = m.sender?.id;
+        const user   = m.sender?.displayName || 'anon';
+        onChat(userId, user, m.text || '');
+      }
+      return;
+    }
+
+    // Diamond receipt → onGift() only for live-stream gift payments
+    if (evt.type === 'diamonds.received') {
+      const d = evt.data || {};
+      if (d.source === 'STREAM' && d.type === 'GIFT' && d.sender?.id) {
+        onGift(d.sender.id, d.sender.displayName || 'anon', 'Gift', 1, Number(d.amount) || 0);
+      }
+      return;
+    }
+
+    // Other event types (follower, subscription, etc.) are intentionally ignored.
+  }
+
+  function handleTangoWebhook(req, res) {
+    const raw = Buffer.isBuffer(req.body)
+      ? req.body.toString('utf8')
+      : JSON.stringify(req.body || {});
+
+    const sig = req.get('TNG-Webhook-Signature') || req.get('X-Tango-Signature') || '';
+    if (!verifyTangoSignature(raw, sig, TANGO_SIGNING_SECRET)) {
+      console.warn('⚠️  Tango webhook signature verification failed');
+      return res.sendStatus(401);
+    }
+
+    let evt;
+    try { evt = JSON.parse(raw); }
+    catch (e) {
+      console.error('Tango webhook JSON parse error:', e.message);
+      return res.sendStatus(400);
+    }
+
+    try { dispatchTangoEvent(evt); }
+    catch (e) { console.error('Tango event handler error:', e); }
+
+    res.sendStatus(200);                             // acknowledge within 5s
+  }
+
+  // Tango appends the encrypted creator ID, so accept both forms.
+  app.post('/tango-hook',                handleTangoWebhook);
+  app.post('/tango-hook/:creatorId',     handleTangoWebhook);
+
+  console.log('🎛  Tango webhook adapter enabled — POST /tango-hook');
+  if (!TANGO_SIGNING_SECRET) console.warn('⚠️  TANGO_SIGNING_SECRET is not set — signatures will NOT be verified!');
+}
+
 // ---- TikTok adapter (PLATFORM=tiktok only; library is optional) ----
 let connection = null;
 
@@ -480,7 +588,7 @@ const first = rand(RIVALRIES);
 startRound(first.teamA, first.teamB);
 
 if (DEMO_MODE) {
-  console.log('🧪 DEMO_MODE active — TikTok connection skipped');
+  console.log('🧪 DEMO_MODE active — live platform connection skipped');
   if (AUTO_DEMO) {
     console.log('🎲 AUTO_DEMO — random events every 900ms');
     setInterval(() => {
@@ -496,8 +604,9 @@ if (DEMO_MODE) {
     }, 900);
   }
 } else {
-  if (PLATFORM === 'tiktok') connectTikTok();
-  else console.log(`🔌 PLATFORM=${PLATFORM}: no direct chat/gift connection. Send events to POST /event or use /operator.`);
+  if (PLATFORM === 'tiktok')      connectTikTok();
+  else if (PLATFORM === 'tango')  console.log('🔌 PLATFORM=tango — waiting for webhook events at POST /tango-hook');
+  else                            console.log(`🔌 PLATFORM=${PLATFORM}: no direct chat/gift connection. Send events to POST /event or use /operator.`);
 }
 
 // ============================================================
