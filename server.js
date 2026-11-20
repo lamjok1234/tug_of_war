@@ -470,50 +470,49 @@ if (PLATFORM === 'tango') {
   // Tango sends:  X-Tango-Signature: sha256=<lowercase hex HMAC-SHA256 of raw body>
   // Some deployments may send just the hex without the "sha256=" prefix — handle both.
   // The Stripe-style "t=..,v1=.." format is also accepted as a fallback for compatibility.
-  function verifyTangoSignature(rawBody, signatureHeader, secret) {
-    if (!secret) return true;                        // dev only
-    if (!signatureHeader) return false;
+function verifyTangoSignature(rawBody, signatureHeader, secret) {
+  if (!secret) return true;                        // dev only
+  if (!signatureHeader) return false;
 
-    const header = String(signatureHeader).trim();
+  const header = String(signatureHeader).trim();
 
-    // Extract the candidate hex digest
-    let candidate = null;
+  // Extract the hex digest — accept "sha256=<hex>" and bare hex.
+  let candidateHex = null;
+  const m = header.match(/^sha256=([0-9a-fA-F]+)$/);
+  if (m) candidateHex = m[1];
+  else if (/^[0-9a-fA-F]+$/.test(header)) candidateHex = header;
 
-    if (header.includes('=')) {
-      // Tango canonical: "sha256=<hex>"
-      const m = header.match(/^sha256=([0-9a-fA-F]+)$/);
-      if (m) candidate = m[1];
-    } else if (/^[0-9a-fA-F]+$/.test(header)) {
-      // Bare hex digest
-      candidate = header;
+  // Stripe-style "t=...,v1=..." fallback
+  let signedBody = rawBody;
+  if (!candidateHex) {
+    const parts = header.split(',').map((s) => s.trim());
+    const v1 = parts.find((p) => p.startsWith('v1='))?.slice(3);
+    const t  = parts.find((p) => p.startsWith('t='))?.slice(2);
+    if (v1) {
+      candidateHex = v1;
+      if (t) signedBody = `${t}.${rawBody}`;
     }
-
-    // Fallback: Stripe-style "t=...,v1=..."
-    if (!candidate) {
-      const parts = header.split(',').map((s) => s.trim());
-      const v1 = parts.find((p) => p.startsWith('v1='))?.slice(3);
-      const t  = parts.find((p) => p.startsWith('t='))?.slice(2);
-      if (v1) {
-        const signed = t ? `${t}.${rawBody}` : rawBody;
-        candidate = v1;
-        try {
-          const expected = crypto.createHmac('sha256', secret).update(signed).digest('hex');
-          const a = Buffer.from(candidate, 'hex');
-          const b = Buffer.from(expected, 'hex');
-          return a.length === b.length && crypto.timingSafeEqual(a, b);
-        } catch { return false; }
-      }
-    }
-
-    if (!candidate) return false;
-
-    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
-    try {
-      const a = Buffer.from(candidate, 'hex');
-      const b = Buffer.from(expected, 'hex');
-      return a.length === b.length && crypto.timingSafeEqual(a, b);
-    } catch { return false; }
   }
+  if (!candidateHex) return false;
+
+  // Try every plausible HMAC key derived from the secret.
+  const keys = [Buffer.from(secret, 'utf8')];           // A: full "whsec_..." string
+  if (secret.startsWith('whsec_')) {
+    const tail = secret.slice(6);
+    keys.push(Buffer.from(tail, 'utf8'));               // B: stripped prefix, ASCII
+    try { keys.push(Buffer.from(tail, 'base64')); }     // C: stripped prefix, Base64-decoded
+    catch { /* invalid base64 — skip */ }
+  }
+
+  const received = Buffer.from(candidateHex, 'hex');
+  for (const key of keys) {
+    const expected = crypto.createHmac('sha256', key).update(signedBody).digest();
+    if (received.length === expected.length && crypto.timingSafeEqual(received, expected)) {
+      return true;                                      // matched — which key won doesn't matter
+    }
+  }
+  return false;
+}
 
 function dispatchTangoEvent(evt) {
   const type = evt?.type || '(missing type)';
