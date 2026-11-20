@@ -28,7 +28,14 @@ const GIFT_SCALE  = Number(process.env.GIFT_SCALE) || 1;
 const RULES = { finalPushMs: 30000, finalMult: 2, comebackRatio: 0.25, comebackMult: 1.25 };
 const BROADCAST_MIN_MS = 100;
 
-const TANGO_SIGNING_SECRET = process.env.TANGO_SIGNING_SECRET || '';
+// ---- Tango webhook settings ----
+const TANGO_SIGNING_SECRET  = process.env.TANGO_SIGNING_SECRET || '';
+// Without a secret, unsigned webhooks are refused (anyone could fake gifts) unless you opt in explicitly.
+const TANGO_ALLOW_UNSIGNED  = process.env.TANGO_ALLOW_UNSIGNED === '1' || DEMO_MODE;
+const TANGO_DEBUG           = process.env.TANGO_DEBUG !== '0';          // verbose Tango event logging (ON by default; set TANGO_DEBUG=0 to silence)
+// diamonds.received "amount": by default treated as the TOTAL for the whole gift (÷ giftCount per unit).
+// Set TANGO_AMOUNT_PER_GIFT=1 if a real sample shows amount is already per single gift.
+const TANGO_AMOUNT_PER_GIFT = process.env.TANGO_AMOUNT_PER_GIFT === '1';
 
 // tiktok  → curated GIFT_POWER_MAP wins; raw diamond count is only a fallback
 // tango / generic → the numeric value (diamonds) is authoritative
@@ -66,6 +73,7 @@ const GIFT_POWER_MAP = {
 const POWER = { food: 15, drink: 5 };
 
 const GIFT_TIERS = ['Rose', 'FingerHeart', 'IceCreamCone', 'Lion', 'Universe'];
+const TIER_MIN   = [1, 5, 10, 50, 100];
 const LOCAL_GIFTS = {
   Turkey:     ['🍆 İmam Bayıldı', '🥟 Mantı', '🍦 Maraş Dondurma', '🥙 Adana Kebap', '🥮 Baklava Tower'],
   Greece:     ['🥗 Horiatiki', '🥙 Souvlaki', '🍯 Loukoumades', '🍲 Moussaka', '🥃 Ouzo Barrel'],
@@ -83,9 +91,12 @@ const splitSkin = (s) => { const i = s.indexOf(' '); return { icon: s.slice(0, i
 const tierOf = (base) => base >= 100 ? 4 : base >= 50 ? 3 : base >= 10 ? 2 : base >= 5 ? 1 : 0;
 const skinFor = (country, base) => splitSkin((LOCAL_GIFTS[country] || DEFAULT_GIFTS)[tierOf(base)]);
 
+// On diamond platforms the real power equals diamonds × GIFT_SCALE, so the menu shows the diamond
+// threshold of each tier ("50💎+") instead of a fixed "+50" that would be wrong.
 const giftMenu = (country) =>
   (LOCAL_GIFTS[country] || DEFAULT_GIFTS).map((s, i) => ({
     gift: GIFT_TIERS[i], ...splitSkin(s), power: GIFT_POWER_MAP[GIFT_TIERS[i]],
+    label: DEFAULT_USE_DIAMONDS ? `${Math.ceil(TIER_MIN[i] / GIFT_SCALE)}💎+` : undefined,
   }));
 
 // ============================================================
@@ -326,7 +337,7 @@ const wss = new WebSocketServer({ server });
 app.disable('x-powered-by');
 
 if (PLATFORM === 'tango') {
-  // Keep raw buffer for HMAC verification
+  // Keep the raw buffer for HMAC verification
   app.use('/tango-hook', express.raw({ type: '*/*', limit: '1mb' }));
 
   // OPTIONS probe used by Tango to validate the URL
@@ -435,14 +446,14 @@ function onChat(userId, user, text) {
   broadcast();
 }
 
+// value = diamonds (or coins) for ONE gift. GIFT_SCALE is applied here, once. No rounding until the final power.
 function onGift(userId, user, name, count = 1, value = 0) {
   if (!userId) return;
-  const scaled = Math.round(value * GIFT_SCALE);
   if (!gameState.roundActive) {
-    if (pendingGifts.length < 300) pendingGifts.push([userId, user, name, count, scaled / GIFT_SCALE]);
+    if (pendingGifts.length < 300) pendingGifts.push([userId, user, name, count, value]);   // raw value: scaled when replayed
     return;
   }
-  gift(sideFor(userId, user), user, name || 'Gift', count, scaled);
+  gift(sideFor(userId, user), user, name || 'Gift', count, value * GIFT_SCALE);
   broadcast();
 }
 
@@ -466,134 +477,104 @@ if (EVENT_TOKEN) {
 
 // ---- Tango webhook adapter ----
 if (PLATFORM === 'tango') {
+  const seenDeliveries = new Set();                     // retried deliveries have an identical body → ignore repeats
+  const dbg = (...a) => { if (TANGO_DEBUG) console.log(...a); };
 
   // Tango sends:  X-Tango-Signature: sha256=<lowercase hex HMAC-SHA256 of raw body>
-  // Some deployments may send just the hex without the "sha256=" prefix — handle both.
-  // The Stripe-style "t=..,v1=.." format is also accepted as a fallback for compatibility.
-function verifyTangoSignature(rawBody, signatureHeader, secret) {
-  if (!secret) return true;                        // dev only
-  if (!signatureHeader) return false;
+  // Bare hex (no "sha256=" prefix) and the Stripe-style "t=..,v1=.." format are accepted as fallbacks.
+  function verifyTangoSignature(rawBody, signatureHeader, secret) {
+    if (!secret) return TANGO_ALLOW_UNSIGNED;
+    if (!signatureHeader) return false;
 
-  const header = String(signatureHeader).trim();
+    const header = String(signatureHeader).trim();
 
-  // Extract the hex digest — accept "sha256=<hex>" and bare hex.
-  let candidateHex = null;
-  const m = header.match(/^sha256=([0-9a-fA-F]+)$/);
-  if (m) candidateHex = m[1];
-  else if (/^[0-9a-fA-F]+$/.test(header)) candidateHex = header;
+    let candidateHex = null;
+    const m = header.match(/^sha256=([0-9a-fA-F]+)$/);
+    if (m) candidateHex = m[1];
+    else if (/^[0-9a-fA-F]+$/.test(header)) candidateHex = header;
 
-  // Stripe-style "t=...,v1=..." fallback
-  let signedBody = rawBody;
-  if (!candidateHex) {
-    const parts = header.split(',').map((s) => s.trim());
-    const v1 = parts.find((p) => p.startsWith('v1='))?.slice(3);
-    const t  = parts.find((p) => p.startsWith('t='))?.slice(2);
-    if (v1) {
-      candidateHex = v1;
-      if (t) signedBody = `${t}.${rawBody}`;
+    let signedBody = rawBody;
+    if (!candidateHex) {
+      const parts = header.split(',').map((s) => s.trim());
+      const v1 = parts.find((p) => p.startsWith('v1='))?.slice(3);
+      const t  = parts.find((p) => p.startsWith('t='))?.slice(2);
+      if (v1) {
+        candidateHex = v1;
+        if (t) signedBody = `${t}.${rawBody}`;
+      }
     }
-  }
-  if (!candidateHex) return false;
+    if (!candidateHex) return false;
 
-  // Try every plausible HMAC key derived from the secret.
-  const keys = [Buffer.from(secret, 'utf8')];           // A: full "whsec_..." string
-  if (secret.startsWith('whsec_')) {
-    const tail = secret.slice(6);
-    keys.push(Buffer.from(tail, 'utf8'));               // B: stripped prefix, ASCII
-    try { keys.push(Buffer.from(tail, 'base64')); }     // C: stripped prefix, Base64-decoded
-    catch { /* invalid base64 — skip */ }
-  }
-
-  const received = Buffer.from(candidateHex, 'hex');
-  for (const key of keys) {
-    const expected = crypto.createHmac('sha256', key).update(signedBody).digest();
-    if (received.length === expected.length && crypto.timingSafeEqual(received, expected)) {
-      return true;                                      // matched — which key won doesn't matter
+    // Try every plausible HMAC key derived from the secret.
+    const keys = [Buffer.from(secret, 'utf8')];          // A: full "whsec_..." string
+    if (secret.startsWith('whsec_')) {
+      const tail = secret.slice(6);
+      keys.push(Buffer.from(tail, 'utf8'));              // B: prefix stripped, ASCII
+      keys.push(Buffer.from(tail, 'base64'));            // C: prefix stripped, Base64-decoded
     }
-  }
-  return false;
-}
 
-function dispatchTangoEvent(evt) {
-  const type = evt?.type || '(missing type)';
-  const data = evt?.data;
-  console.log(`📥 Tango event received: type=${type}`);
-
-  // ---- chat batch ----
-  if (type === 'stream.chat.messages.received') {
-    const msgs = data?.messages || [];
-    console.log(`💬 chat batch: ${msgs.length} message(s)`);
-
-    for (const m of msgs) {
-      const userId = m?.sender?.id;
-      const user   = m?.sender?.displayName || 'anon';
-      const text   = m?.text || '';
-
-      if (m?.systemMessage) {
-        console.log(`   ⏭  skip system message from "${user}": "${text.slice(0, 60)}"`);
-        continue;
-      }
-      if (!userId) {
-        console.warn(`   ⚠️  skip message with no sender.id: user="${user}" text="${text.slice(0, 60)}"`);
-        continue;
-      }
-      if (!text.startsWith('!')) {
-        console.log(`   💤 non-command from "${user}": "${text.slice(0, 60)}"`);
-        // still pass it — onChat() itself ignores non-commands, but keeping the call
-        // means future command-like messages are handled uniformly.
-      }
-
-      console.log(`   → onChat(userId=${userId}, user="${user}", text="${text.slice(0, 60)}")`);
-      onChat(userId, user, text);
+    const received = Buffer.from(candidateHex, 'hex');
+    for (const key of keys) {
+      const expected = crypto.createHmac('sha256', key).update(signedBody).digest();
+      if (received.length === expected.length && crypto.timingSafeEqual(received, expected)) return true;
     }
-    return;
+    return false;
   }
 
-  // ---- diamonds / gifts ----
-  if (type === 'diamonds.received') {
-    const items = Array.isArray(data) ? data : [data];
-    console.log(`💎 diamonds.received: ${items.length} item(s)`);
+  function dispatchTangoEvent(evt) {
+    const type = evt?.type || '(missing type)';
+    const data = evt?.data;
+    dbg(`📥 Tango event received: type=${type}`);
 
-    for (const d of items) {
-      if (!d) {
-        console.warn('   ⚠️  skip null/undefined gift item');
-        continue;
+    // ---- chat batch ----
+    if (type === 'stream.chat.messages.received') {
+      const msgs = data?.messages || [];
+      dbg(`💬 chat batch: ${msgs.length} message(s)`);
+
+      for (const m of msgs) {
+        const userId = m?.sender?.id;
+        const user   = m?.sender?.displayName || 'anon';
+        const text   = m?.text || '';
+
+        if (m?.systemMessage) { dbg(`   ⏭  skip system message from "${user}"`); continue; }
+        if (!userId) { console.warn(`   ⚠️  skip message with no sender.id: user="${user}"`); continue; }
+        if (!text.startsWith('!')) { dbg(`   💤 non-command from "${user}": "${text.slice(0, 60)}"`); continue; }
+
+        dbg(`   → onChat(userId=${userId}, user="${user}", text="${text.slice(0, 60)}")`);
+        onChat(userId, user, text);
       }
-
-      const senderId = d.sender?.id;
-      const user     = d.sender?.displayName || 'anon';
-      const src      = d.source ?? '(no source)';
-      const kind     = d.type ?? '(no type)';
-
-      if (d.source !== 'STREAM') {
-        console.log(`   ⏭  skip non-STREAM gift (source=${src}, type=${kind}, user="${user}")`);
-        continue;
-      }
-      if (d.type !== 'GIFT') {
-        console.log(`   ⏭  skip non-GIFT diamond event (source=${src}, type=${kind}, user="${user}")`);
-        continue;
-      }
-      if (!senderId) {
-        console.warn(`   ⚠️  skip gift with no sender.id (user="${user}", amount=${d.amount})`);
-        continue;
-      }
-
-      const giftName = String(d.giftName || d.gift?.name || d.giftId || 'Gift').slice(0, 40);
-      const count    = clamp(Number(d.giftCount || d.count) || 1, 1, 99);
-      const amount   = Number(d.amount) || 0;
-
-      console.log(
-        `   🎁 → onGift(userId=${senderId}, user="${user}", gift="${giftName}", ` +
-        `count=${count}, amount=${amount})`
-      );
-      onGift(senderId, user, giftName, count, amount);
+      return;
     }
-    return;
+
+    // ---- diamonds / gifts ----
+    if (type === 'diamonds.received') {
+      const items = Array.isArray(data) ? data : [data];
+      dbg(`💎 diamonds.received: ${items.length} item(s)`);
+
+      for (const d of items) {
+        if (!d) { console.warn('   ⚠️  skip null/undefined gift item'); continue; }
+
+        const senderId = d.sender?.id;
+        const user     = d.sender?.displayName || 'anon';
+
+        if (d.source !== 'STREAM') { dbg(`   ⏭  skip non-STREAM (source=${d.source}, user="${user}")`); continue; }
+        if (d.type !== 'GIFT')     { dbg(`   ⏭  skip non-GIFT (type=${d.type}, user="${user}")`); continue; }
+        if (!senderId) { console.warn(`   ⚠️  skip gift with no sender.id (user="${user}", amount=${d.amount})`); continue; }
+
+        const giftName = String(d.giftName || d.gift?.name || d.giftId || 'Gift').slice(0, 40);
+        const count    = clamp(Number(d.giftCount || d.count) || 1, 1, 99);
+        const amount   = Number(d.amount) || 0;
+        const perGift  = TANGO_AMOUNT_PER_GIFT ? amount : amount / count;   // value of ONE gift
+
+        console.log(`🎁 Tango gift: user="${user}" gift="${giftName}" count=${count} amount=${amount} → per gift ${perGift}`);
+        onGift(senderId, user, giftName, count, perGift);
+      }
+      return;
+    }
+
+    dbg(`🚫 unhandled Tango event type "${type}" — ignored`);
   }
 
-  // ---- anything else ----
-  console.log(`🚫 unhandled Tango event type "${type}" — ignored`);
-}
   function handleTangoWebhook(req, res) {
     const raw = Buffer.isBuffer(req.body)
       ? req.body.toString('utf8')
@@ -605,10 +586,15 @@ function dispatchTangoEvent(evt) {
              || '';
 
     if (!verifyTangoSignature(raw, sig, TANGO_SIGNING_SECRET)) {
-      console.warn('⚠️  Tango webhook signature verification failed',
-                   `(header="${String(sig).slice(0, 24)}…", bodyLen=${raw.length}, secretSet=${!!TANGO_SIGNING_SECRET})`);
+      console.warn('⚠️  Tango webhook rejected (bad or missing signature)',
+                   `header="${String(sig).slice(0, 24)}…" bodyLen=${raw.length} secretSet=${!!TANGO_SIGNING_SECRET}`);
       return res.sendStatus(401);
     }
+
+    const digest = crypto.createHash('sha256').update(raw).digest('hex');
+    if (seenDeliveries.has(digest)) { dbg('🔁 duplicate delivery ignored'); return res.sendStatus(200); }
+    seenDeliveries.add(digest);
+    if (seenDeliveries.size > 2000) seenDeliveries.delete(seenDeliveries.values().next().value);
 
     let evt;
     try { evt = JSON.parse(raw); }
@@ -624,7 +610,9 @@ function dispatchTangoEvent(evt) {
 
   console.log('🎛  Tango webhook adapter enabled — POST /tango-hook');
   if (!TANGO_SIGNING_SECRET) {
-    console.warn('⚠️  TANGO_SIGNING_SECRET is not set — signatures will NOT be verified!');
+    console.warn(TANGO_ALLOW_UNSIGNED
+      ? '⚠️  TANGO_SIGNING_SECRET not set — unsigned webhooks ACCEPTED (test mode only!)'
+      : '⚠️  TANGO_SIGNING_SECRET not set — all Tango webhooks will be REJECTED until you set it');
   } else {
     console.log(`🔐 Tango signature verification active (secret length ${TANGO_SIGNING_SECRET.length})`);
   }
