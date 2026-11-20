@@ -12,27 +12,29 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ============================================================
 const TIKTOK_USERNAME    = process.env.TIKTOK_USER || 'YOUR_TIKTOK_USERNAME';
 const PORT               = Number(process.env.PORT) || 8080;
-const ROUND_DURATION_MS  = (Number(process.env.ROUND_SECONDS) || 300) * 1000;   // default 5 min
-const INTERMISSION_MS    = (Number(process.env.BREAK_SECONDS) || 10) * 1000;      // break between rounds
+const ROUND_DURATION_MS  = (Number(process.env.ROUND_SECONDS) || 300) * 1000;
+const INTERMISSION_MS    = (Number(process.env.BREAK_SECONDS) || 10) * 1000;
 const PULLER_DURATION_MS = 4000;
-const CHAT_COOLDOWN_MS   = 1200;           // per-user spam guard for !food / !drink
+const CHAT_COOLDOWN_MS   = 1200;
 const MAX_PULLERS        = 40;
 
 const DEMO_MODE = process.env.DEMO_MODE === '1';
 const AUTO_DEMO = DEMO_MODE && process.env.AUTO_DEMO === '1';
 
-// PLATFORM: 'tiktok' (reads TikTok LIVE directly) | 'tango' | 'generic'.
-// For tango/generic there is no direct connection: events arrive via webhook or POST /event.
 const PLATFORM    = (process.env.PLATFORM || 'tiktok').toLowerCase();
 const EVENT_TOKEN = process.env.EVENT_TOKEN || (DEMO_MODE ? 'demo' : '');
-const GIFT_SCALE  = Number(process.env.GIFT_SCALE) || 1;     // coins/diamonds → power for gifts not in GIFT_POWER_MAP
-// Gift-only boosts (free !food/!drink never get them): last seconds count double, trailing team gets a bonus.
-const RULES = { finalPushMs: 30000, finalMult: 2, comebackRatio: 0.25, comebackMult: 1.25 };
-const BROADCAST_MIN_MS = 100;                                  // at most 10 state updates per second
+const GIFT_SCALE  = Number(process.env.GIFT_SCALE) || 1;
 
-// Tango webhook signing secret (from tangoagent.io when you create the webhook)
+const RULES = { finalPushMs: 30000, finalMult: 2, comebackRatio: 0.25, comebackMult: 1.25 };
+const BROADCAST_MIN_MS = 100;
+
 const TANGO_SIGNING_SECRET = process.env.TANGO_SIGNING_SECRET || '';
-const TANGO_MAX_SKEW_S     = 300;                              // reject webhooks older than 5 min (replay protection)
+const TANGO_MAX_SKEW_S     = 300;
+
+// ✅ NEW: how the numeric gift value should be interpreted per platform.
+//  - tiktok:  GIFT_POWER_MAP (curated) wins; raw diamond count is only a fallback.
+//  - tango / generic: the numeric value (diamonds) is authoritative.
+const DEFAULT_USE_DIAMONDS = (PLATFORM === 'tango' || PLATFORM === 'generic');
 
 // ============================================================
 // [2] DATA
@@ -65,8 +67,6 @@ const GIFT_POWER_MAP = {
 };
 const POWER = { food: 15, drink: 5 };
 
-// Gift skins: TikTok's gift catalog is fixed, so each power tier is re-skinned
-// as a local dish per team. Order = GIFT_TIERS (weakest → strongest).
 const GIFT_TIERS = ['Rose', 'FingerHeart', 'IceCreamCone', 'Lion', 'Universe'];
 const LOCAL_GIFTS = {
   Turkey:     ['🍆 İmam Bayıldı', '🥟 Mantı', '🍦 Maraş Dondurma', '🥙 Adana Kebap', '🥮 Baklava Tower'],
@@ -80,14 +80,19 @@ const LOCAL_GIFTS = {
   Kurdistan:  ['🫓 Nan', '🥟 Kubba', '🥬 Dolma', '🍢 Kebap', '🍲 Kurdish Feast'],
 };
 const DEFAULT_GIFTS = ['🌹 Rose', '🫰 Finger Heart', '🍦 Ice Cream', '🦁 Lion', '🌌 Universe'];
+
 const splitSkin = (s) => { const i = s.indexOf(' '); return { icon: s.slice(0, i), name: s.slice(i + 1) }; };
-const tierOf = (name, base) => {
-  const i = GIFT_TIERS.indexOf(name);
-  return i >= 0 ? i : base >= 100 ? 4 : base >= 50 ? 3 : base >= 10 ? 2 : base >= 5 ? 1 : 0;
-};
-const skinFor = (country, name, base) => splitSkin((LOCAL_GIFTS[country] || DEFAULT_GIFTS)[tierOf(name, base)]);
+
+// ✅ CHANGED: tier is now derived from the numeric value (diamonds / power) only.
+// This makes skins consistent across platforms: 1 diamond → Rose tier,
+// 100 diamonds → Universe tier, regardless of gift name.
+const tierOf = (base) => base >= 100 ? 4 : base >= 50 ? 3 : base >= 10 ? 2 : base >= 5 ? 1 : 0;
+const skinFor = (country, base) => splitSkin((LOCAL_GIFTS[country] || DEFAULT_GIFTS)[tierOf(base)]);
+
 const giftMenu = (country) =>
-  (LOCAL_GIFTS[country] || DEFAULT_GIFTS).map((s, i) => ({ gift: GIFT_TIERS[i], ...splitSkin(s), power: GIFT_POWER_MAP[GIFT_TIERS[i]] }));
+  (LOCAL_GIFTS[country] || DEFAULT_GIFTS).map((s, i) => ({
+    gift: GIFT_TIERS[i], ...splitSkin(s), power: GIFT_POWER_MAP[GIFT_TIERS[i]],
+  }));
 
 // ============================================================
 // [3] STATE
@@ -97,7 +102,7 @@ let gameState = {
   powerA: 0, powerB: 0,
   roundStartTime: Date.now(), roundEndTime: Date.now(),
   roundActive: false,
-  phase: 'idle',                             // idle | playing | ended
+  phase: 'idle',
   matchHistory: [],
   items: { A: null, B: null },
   events: [],
@@ -107,17 +112,14 @@ let gameState = {
   pullersB: [],
 };
 
-const viewerCountry = new Map();             // userId → country (sticky across rounds)
-const roundGifts = { A: new Map(), B: new Map() };   // user → gift power this round (for MVP crowns)
-const pendingGifts = [];                     // gifts sent during the break; credited when the next round starts
-const chatCooldown = new Map();              // userId → last command ts
-let nextRoundTimer = null;                   // single handle → no duplicate rounds
+const viewerCountry = new Map();
+const roundGifts = { A: new Map(), B: new Map() };
+const pendingGifts = [];
+const chatCooldown = new Map();
+let nextRoundTimer = null;
 const rand = (a) => a[Math.floor(Math.random() * a.length)];
 const isTeam = (t) => t === 'A' || t === 'B';
 
-// ---- viewer side selection -------------------------------------------------
-// A viewer picks a side once by typing the team name (!turkey), !1/!2, !a/!b, !join1/!join2,
-// or plain !join (auto-balance). The choice sticks while their country keeps playing.
 const SIDE_A = ['1', 'a', 'join1', 'join 1', 'join a', 'joina'];
 const SIDE_B = ['2', 'b', 'join2', 'join 2', 'join b', 'joinb'];
 const teamOf = (id) => {
@@ -140,24 +142,20 @@ function parseSide(cmd) {
 }
 function joinSide(userId, user, team) {
   viewerCountry.set(userId, countryOf(team));
-  if (viewerCountry.size > 5000) {                       // keep memory bounded on long streams
+  if (viewerCountry.size > 5000) {
     for (const k of viewerCountry.keys()) { viewerCountry.delete(k); if (viewerCountry.size <= 4000) break; }
   }
   join(team, user);
 }
-// Anyone who gifts or buys without picking a side is placed on the smaller team.
 function sideFor(userId, user) {
   return teamOf(userId) || (joinSide(userId, user, smallerSide()), teamOf(userId));
 }
 
 // ============================================================
-// [4] CORE GAME LOGIC (shared by platform handlers + test endpoints)
+// [4] CORE GAME LOGIC
 // ============================================================
-// ---- daily leaderboard: countries ranked by today's results (3 pts win, 1 draw) ----
-// Resets at local midnight and is saved to disk, so a server restart doesn't lose it.
-// DATA_DIR lets a host with a persistent volume (e.g. Railway: /data) keep the board across deploys.
 const DAILY_FILE = path.join(process.env.DATA_DIR || __dirname, DEMO_MODE ? 'daily.demo.json' : 'daily.json');
-const dayKey = () => new Date().toLocaleDateString('en-CA', process.env.DAY_TZ ? { timeZone: process.env.DAY_TZ } : undefined);  // YYYY-MM-DD; set DAY_TZ e.g. Europe/Istanbul
+const dayKey = () => new Date().toLocaleDateString('en-CA', process.env.DAY_TZ ? { timeZone: process.env.DAY_TZ } : undefined);
 function loadDaily() {
   try { const d = JSON.parse(fs.readFileSync(DAILY_FILE, 'utf8')); if (d.day === dayKey()) { d.gifters ||= {}; return d; } } catch { /* first run */ }
   return { day: dayKey(), stats: {}, gifters: {} };
@@ -226,18 +224,37 @@ function giftMult(team) {
   return m;
 }
 
+// ✅ CHANGED: gift() now supports two interpretations of the numeric `diamonds`
+// argument. When DEFAULT_USE_DIAMONDS is true (Tango / generic), the value is
+// treated as the authoritative power — GIFT_POWER_MAP is only a fallback for
+// curated demo names with no numeric value. When false (TikTok), the curated
+// GIFT_POWER_MAP stays authoritative and raw diamonds are only used for
+// unknown gifts.
 function gift(team, user, name, count = 1, diamonds = 0) {
   if (!gameState.roundActive) return;
   count = Math.min(999, Math.max(1, Math.floor(count) || 1));
-  const base = GIFT_POWER_MAP[name] || diamonds || 10;
+
+  const curated = GIFT_POWER_MAP[name];
+  const base = DEFAULT_USE_DIAMONDS
+    ? (diamonds > 0 ? diamonds : (curated ?? 1))
+    : (curated ?? (diamonds > 0 ? diamonds : 1));
+
   const mult = giftMult(team);
   const power = Math.round(base * count * mult);
-  const skin = skinFor(countryOf(team), name, base);
+  const skin = skinFor(countryOf(team), base);
+
   addPower(team, power);
   addPuller(team, user);
   roundGifts[team].set(user, (roundGifts[team].get(user) || 0) + power);
   recordGifter(user, power);
-  pushEvent({ kind: 'gift', user, team, item: skin.name, icon: skin.icon, base: name, count, power, mult, country: countryOf(team) });
+  pushEvent({
+    kind: 'gift', user, team,
+    item: skin.name, icon: skin.icon,
+    base: name,
+    diamonds: diamonds || 0,
+    count, power, mult,
+    country: countryOf(team),
+  });
 }
 
 function getNextMatch(winner) {
@@ -271,7 +288,7 @@ function startRound(teamA, teamB) {
   roundGifts.A.clear(); roundGifts.B.clear();
   console.log(`🎮 New round: ${teamA} vs ${teamB}`);
   broadcast();
-  const queued = pendingGifts.splice(0);                 // gifts sent during the break still count
+  const queued = pendingGifts.splice(0);
   queued.forEach((g) => onGift(...g));
 }
 
@@ -298,7 +315,6 @@ function endRound() {
   }
   saveDaily();
 
-  // Announce the next matchup during the intermission.
   const next = winner ? getNextMatch(winner) : { teamA, teamB };
   gameState.next = {
     ...next,
@@ -321,13 +337,8 @@ const wss = new WebSocketServer({ server });
 
 app.disable('x-powered-by');
 
-// ---- Tango raw-body capture + OPTIONS probe (must run BEFORE express.json) ----
 if (PLATFORM === 'tango') {
-  // Keep the raw Buffer for HMAC verification. Body-parser sets req._body=true,
-  // so the later express.json() will skip this request path.
   app.use('/tango-hook', express.raw({ type: 'application/json', limit: '1mb' }));
-
-  // Tango validates the webhook URL with an OPTIONS request.
   app.use((req, res, next) => {
     if (req.method === 'OPTIONS' && req.path.startsWith('/tango-hook')) {
       return res
@@ -354,7 +365,7 @@ function snapshot() {
       mvp: { A: mvpOf('A'), B: mvpOf('B') },
       supporters: supporters(),
       leaderboard: leaderboard(),
-      serverTime: now,                       // lets clients correct clock skew
+      serverTime: now,
       pullersA: gameState.pullersA.filter((p) => p.expiresAt > now),
       pullersB: gameState.pullersB.filter((p) => p.expiresAt > now),
     },
@@ -366,10 +377,10 @@ function flush() {
   flushTimer = null;
   lastSend = Date.now();
   if (!wss.clients.size) return;
-  const payload = snapshot();                            // built once, sent to every overlay
+  const payload = snapshot();
   wss.clients.forEach((c) => c.readyState === 1 && c.bufferedAmount < 1e6 && c.send(payload));
 }
-function broadcast() {                                   // coalesces bursts into ≤10 updates/second
+function broadcast() {
   if (flushTimer) return;
   flushTimer = setTimeout(flush, Math.max(0, BROADCAST_MIN_MS - (Date.now() - lastSend)));
 }
@@ -399,7 +410,7 @@ if (DEMO_MODE) {
   route('join',  (b) => join(b.team, b.user || 'tester'));
   route('food',  (b) => buy(b.team, b.user || 'tester', 'food'));
   route('drink', (b) => buy(b.team, b.user || 'tester', 'drink'));
-  route('gift',  (b) => gift(b.team, b.user || 'tester', b.gift || 'Lion', Number(b.count) || 1));
+  route('gift',  (b) => gift(b.team, b.user || 'tester', b.gift || 'Lion', Number(b.count) || 1, Number(b.diamonds) || 0));
   route('speedup', () => { gameState.roundEndTime = Date.now() + 10000; });
   route('end',   () => endRound());
   route('reset', () => { const r = rand(RIVALRIES); startRound(r.teamA, r.teamB); });
@@ -411,7 +422,7 @@ if (DEMO_MODE) {
 }
 
 // ============================================================
-// [7] INPUT ADAPTERS — every platform ends up calling onChat / onGift
+// [7] INPUT ADAPTERS
 // ============================================================
 function onChat(userId, user, text) {
   const msg = String(text ?? '').trim().toLowerCase();
@@ -420,7 +431,7 @@ function onChat(userId, user, text) {
 
   const side = parseSide(cmd);
   if (side) {
-    if (teamOf(userId)) return;                         // already on a side that is playing
+    if (teamOf(userId)) return;
     joinSide(userId, user, side === 'auto' ? smallerSide() : side);
     return broadcast();
   }
@@ -435,12 +446,15 @@ function onChat(userId, user, text) {
 
 function onGift(userId, user, name, count = 1, value = 0) {
   if (!userId) return;
-  if (!gameState.roundActive) { if (pendingGifts.length < 300) pendingGifts.push([userId, user, name, count, value]); return; }
-  gift(sideFor(userId, user), user, name || 'Gift', count, Math.round(value * GIFT_SCALE));
+  const scaled = Math.round(value * GIFT_SCALE);
+  if (!gameState.roundActive) {
+    if (pendingGifts.length < 300) pendingGifts.push([userId, user, name, count, scaled / GIFT_SCALE]);
+    return;
+  }
+  gift(sideFor(userId, user), user, name || 'Gift', count, scaled);
   broadcast();
 }
 
-// ---- generic inbound API: bridges, bots or the operator panel POST here ----
 const safeEq = (a, b) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 if (EVENT_TOKEN) {
@@ -459,23 +473,21 @@ if (EVENT_TOKEN) {
   console.log(`🎛  Operator panel: http://localhost:${PORT}/operator?token=<EVENT_TOKEN>   Event API: POST /event`);
 }
 
-// ---- Tango webhook adapter (PLATFORM=tango only) ----
+// ---- Tango webhook adapter ----
 if (PLATFORM === 'tango') {
   function verifyTangoSignature(rawBody, signatureHeader, secret) {
-    if (!secret) return true;                         // no secret configured → accept (dev only)
+    if (!secret) return true;
     if (!signatureHeader) return false;
 
     const parts = String(signatureHeader).split(',').map((s) => s.trim());
     const t  = parts.find((p) => p.startsWith('t='))?.slice(2);
     const v1 = parts.find((p) => p.startsWith('v1='))?.slice(3);
 
-    // Replay protection when a timestamp is supplied.
     if (t) {
       const now = Math.floor(Date.now() / 1000);
       if (!Number.isFinite(Number(t)) || Math.abs(now - Number(t)) > TANGO_MAX_SKEW_S) return false;
     }
 
-    // Signed payload is "<timestamp>.<rawBody>" when a timestamp exists; otherwise just rawBody.
     const payload   = t ? `${t}.${rawBody}` : rawBody;
     const candidate = v1 || signatureHeader;
     const expected  = crypto.createHmac('sha256', secret).update(payload).digest('hex');
@@ -488,35 +500,32 @@ if (PLATFORM === 'tango') {
   }
 
   function dispatchTangoEvent(evt) {
-    // Chat batch → one onChat() per message
     if (evt.type === 'stream.chat.messages.received') {
       const msgs = evt.data?.messages || [];
       for (const m of msgs) {
-        if (m.systemMessage) continue;                // ignore platform/system messages
-        const userId = m.sender?.id;
-        const user   = m.sender?.displayName || 'anon';
-        onChat(userId, user, m.text || '');
+        if (m.systemMessage) continue;
+        onChat(m.sender?.id, m.sender?.displayName || 'anon', m.text || '');
       }
       return;
     }
 
-    // Diamond receipt → onGift() only for live-stream gift payments
+    // ✅ CHANGED: forward Tango's actual gift name / id and the diamond amount.
+    // Accepts either a single object or an array of gift receipts.
     if (evt.type === 'diamonds.received') {
-      const d = evt.data || {};
-      if (d.source === 'STREAM' && d.type === 'GIFT' && d.sender?.id) {
-        onGift(d.sender.id, d.sender.displayName || 'anon', 'Gift', 1, Number(d.amount) || 0);
+      const items = Array.isArray(evt.data) ? evt.data : [evt.data];
+      for (const d of items) {
+        if (!d || d.source !== 'STREAM' || d.type !== 'GIFT' || !d.sender?.id) continue;
+        const giftName = String(d.giftName || d.gift?.name || d.giftId || 'Gift').slice(0, 40);
+        const count    = clamp(Number(d.giftCount || d.count) || 1, 1, 99);
+        const amount   = Number(d.amount) || 0;
+        onGift(d.sender.id, d.sender.displayName || 'anon', giftName, count, amount);
       }
       return;
     }
-
-    // Other event types (follower, subscription, etc.) are intentionally ignored.
   }
 
   function handleTangoWebhook(req, res) {
-    const raw = Buffer.isBuffer(req.body)
-      ? req.body.toString('utf8')
-      : JSON.stringify(req.body || {});
-
+    const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body || {});
     const sig = req.get('TNG-Webhook-Signature') || req.get('X-Tango-Signature') || '';
     if (!verifyTangoSignature(raw, sig, TANGO_SIGNING_SECRET)) {
       console.warn('⚠️  Tango webhook signature verification failed');
@@ -525,26 +534,21 @@ if (PLATFORM === 'tango') {
 
     let evt;
     try { evt = JSON.parse(raw); }
-    catch (e) {
-      console.error('Tango webhook JSON parse error:', e.message);
-      return res.sendStatus(400);
-    }
+    catch (e) { console.error('Tango webhook JSON parse error:', e.message); return res.sendStatus(400); }
 
     try { dispatchTangoEvent(evt); }
     catch (e) { console.error('Tango event handler error:', e); }
-
-    res.sendStatus(200);                             // acknowledge within 5s
+    res.sendStatus(200);
   }
 
-  // Tango appends the encrypted creator ID, so accept both forms.
-  app.post('/tango-hook',                handleTangoWebhook);
-  app.post('/tango-hook/:creatorId',     handleTangoWebhook);
+  app.post('/tango-hook',            handleTangoWebhook);
+  app.post('/tango-hook/:creatorId', handleTangoWebhook);
 
   console.log('🎛  Tango webhook adapter enabled — POST /tango-hook');
   if (!TANGO_SIGNING_SECRET) console.warn('⚠️  TANGO_SIGNING_SECRET is not set — signatures will NOT be verified!');
 }
 
-// ---- TikTok adapter (PLATFORM=tiktok only; library is optional) ----
+// ---- TikTok adapter ----
 let connection = null;
 
 async function connectTikTok(attempt = 1) {
@@ -557,7 +561,6 @@ async function connectTikTok(attempt = 1) {
   connection.on(WebcastEvent.CHAT, (e) => onChat(e.user?.userId, e.user?.uniqueId || 'anon', e.comment ?? e.content));
   connection.on(WebcastEvent.GIFT, (e) => {
     if (!e.gift) return;
-    // Streakable gifts fire many times mid-combo; only count the final tally.
     if (e.giftType === 1 && !e.repeatEnd) return;
     onGift(e.user?.userId, e.user?.uniqueId || 'anon', e.gift.name, e.repeatCount || 1, e.gift.diamondCount || e.diamondCount || 1);
   });
