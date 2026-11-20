@@ -515,29 +515,86 @@ if (PLATFORM === 'tango') {
     } catch { return false; }
   }
 
-  function dispatchTangoEvent(evt) {
-    if (evt.type === 'stream.chat.messages.received') {
-      const msgs = evt.data?.messages || [];
-      for (const m of msgs) {
-        if (m.systemMessage) continue;
-        onChat(m.sender?.id, m.sender?.displayName || 'anon', m.text || '');
-      }
-      return;
-    }
+function dispatchTangoEvent(evt) {
+  const type = evt?.type || '(missing type)';
+  const data = evt?.data;
+  console.log(`📥 Tango event received: type=${type}`);
 
-    if (evt.type === 'diamonds.received') {
-      const items = Array.isArray(evt.data) ? evt.data : [evt.data];
-      for (const d of items) {
-        if (!d || d.source !== 'STREAM' || d.type !== 'GIFT' || !d.sender?.id) continue;
-        const giftName = String(d.giftName || d.gift?.name || d.giftId || 'Gift').slice(0, 40);
-        const count    = clamp(Number(d.giftCount || d.count) || 1, 1, 99);
-        const amount   = Number(d.amount) || 0;
-        onGift(d.sender.id, d.sender.displayName || 'anon', giftName, count, amount);
+  // ---- chat batch ----
+  if (type === 'stream.chat.messages.received') {
+    const msgs = data?.messages || [];
+    console.log(`💬 chat batch: ${msgs.length} message(s)`);
+
+    for (const m of msgs) {
+      const userId = m?.sender?.id;
+      const user   = m?.sender?.displayName || 'anon';
+      const text   = m?.text || '';
+
+      if (m?.systemMessage) {
+        console.log(`   ⏭  skip system message from "${user}": "${text.slice(0, 60)}"`);
+        continue;
       }
-      return;
+      if (!userId) {
+        console.warn(`   ⚠️  skip message with no sender.id: user="${user}" text="${text.slice(0, 60)}"`);
+        continue;
+      }
+      if (!text.startsWith('!')) {
+        console.log(`   💤 non-command from "${user}": "${text.slice(0, 60)}"`);
+        // still pass it — onChat() itself ignores non-commands, but keeping the call
+        // means future command-like messages are handled uniformly.
+      }
+
+      console.log(`   → onChat(userId=${userId}, user="${user}", text="${text.slice(0, 60)}")`);
+      onChat(userId, user, text);
     }
+    return;
   }
 
+  // ---- diamonds / gifts ----
+  if (type === 'diamonds.received') {
+    const items = Array.isArray(data) ? data : [data];
+    console.log(`💎 diamonds.received: ${items.length} item(s)`);
+
+    for (const d of items) {
+      if (!d) {
+        console.warn('   ⚠️  skip null/undefined gift item');
+        continue;
+      }
+
+      const senderId = d.sender?.id;
+      const user     = d.sender?.displayName || 'anon';
+      const src      = d.source ?? '(no source)';
+      const kind     = d.type ?? '(no type)';
+
+      if (d.source !== 'STREAM') {
+        console.log(`   ⏭  skip non-STREAM gift (source=${src}, type=${kind}, user="${user}")`);
+        continue;
+      }
+      if (d.type !== 'GIFT') {
+        console.log(`   ⏭  skip non-GIFT diamond event (source=${src}, type=${kind}, user="${user}")`);
+        continue;
+      }
+      if (!senderId) {
+        console.warn(`   ⚠️  skip gift with no sender.id (user="${user}", amount=${d.amount})`);
+        continue;
+      }
+
+      const giftName = String(d.giftName || d.gift?.name || d.giftId || 'Gift').slice(0, 40);
+      const count    = clamp(Number(d.giftCount || d.count) || 1, 1, 99);
+      const amount   = Number(d.amount) || 0;
+
+      console.log(
+        `   🎁 → onGift(userId=${senderId}, user="${user}", gift="${giftName}", ` +
+        `count=${count}, amount=${amount})`
+      );
+      onGift(senderId, user, giftName, count, amount);
+    }
+    return;
+  }
+
+  // ---- anything else ----
+  console.log(`🚫 unhandled Tango event type "${type}" — ignored`);
+}
   function handleTangoWebhook(req, res) {
     const raw = Buffer.isBuffer(req.body)
       ? req.body.toString('utf8')
