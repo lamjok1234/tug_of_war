@@ -351,7 +351,7 @@ const GP0={Rose:1,FingerHeart:5,IceCreamCone:10,Lion:50,Universe:100};let giftKe
 function renderGifts(s){
   const m=s.giftMenu,k=m?s.teamA+'|'+s.teamB:JSON.stringify(s.giftPowerMap||GP0);if(k===giftKey)return;giftKey=k;
   if(!m){const g=s.giftPowerMap||GP0;$('gifts').innerHTML='<div class="gr"><b>Join a team, then send:</b>'+Object.entries(g).sort((a,b)=>a[1]-b[1]).map(([n,p])=>`<span>${GICON[n]||'🎁'} ${esc(n)} <i>+${p}</i></span>`).join('')+'</div>';return}
-  const row=t=>`<div class="gr ${t}"><b>${s.items?.[t]?.flag||''}</b>`+m[t].map(g=>`<span>${g.icon} ${esc(g.name)} <i>+${g.power}</i></span>`).join('')+'</div>';
+  const row=t=>`<div class="gr ${t}"><b>${s.items?.[t]?.flag||''}</b>`+m[t].map(g=>`<span>${g.icon} ${esc(g.name)} <i>${g.label||'+'+g.power}</i></span>`).join('')+'</div>';
   $('gifts').innerHTML=`<div class="gt">Type !${s.teamA.toLowerCase()} or !${s.teamB.toLowerCase()} to pick a side. Gifts become your team’s dish.</div>`+row('A')+row('B');
 }
 function apply(s){if(s.serverTime)clockOffset=s.serverTime-Date.now();state=s;renderGifts(s);renderUI();handleEffects()}
@@ -467,7 +467,7 @@ function connect(){
   const ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}`);
   ws.onopen=()=>{fails=0};
   ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='state')apply(m.data)};
-  ws.onclose=()=>{fails++;if(fails>=3&&!state)startDemo();else setTimeout(connect,1500)};
+  ws.onclose=()=>{fails++;if(fails>=2&&!state&&!params.has('live'))startDemo();else setTimeout(connect,1500)};
   ws.onerror=()=>ws.close();
 }
 
@@ -522,7 +522,7 @@ function startDemo(){
     if(k===' '&&s.phase==='playing'){e.preventDefault();s.roundEndTime=Date.now()}
   });
 }
-if(params.has('demo')||location.protocol!=='http:')startDemo();else connect();
+if(params.has('demo')||location.protocol==='file:')startDemo();else connect();
 
 // ---------- loop ----------
 const clock=new THREE.Clock(),camLook=new THREE.Vector3(0,1.5,0);
