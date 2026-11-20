@@ -21,6 +21,9 @@ const MAX_PULLERS        = 40;
 const DEMO_MODE = process.env.DEMO_MODE === '1';
 const AUTO_DEMO = DEMO_MODE && process.env.AUTO_DEMO === '1';
 
+// 👇 NEW: Enable synthetic players to keep the game active when real viewers are quiet
+const BOTS_ENABLED = process.env.BOTS === '1' || process.env.BOTS === 'true';
+
 const PLATFORM    = (process.env.PLATFORM || 'tiktok').toLowerCase();
 const EVENT_TOKEN = process.env.EVENT_TOKEN || (DEMO_MODE ? 'demo' : '');
 const GIFT_SCALE  = Number(process.env.GIFT_SCALE) || 1;
@@ -32,9 +35,7 @@ const BROADCAST_MIN_MS = 100;
 const TANGO_SIGNING_SECRET  = process.env.TANGO_SIGNING_SECRET || '';
 // Without a secret, unsigned webhooks are refused (anyone could fake gifts) unless you opt in explicitly.
 const TANGO_ALLOW_UNSIGNED  = process.env.TANGO_ALLOW_UNSIGNED === '1' || DEMO_MODE;
-const TANGO_DEBUG           = process.env.TANGO_DEBUG !== '0';          // verbose Tango event logging (ON by default; set TANGO_DEBUG=0 to silence)
-// diamonds.received "amount": by default treated as the TOTAL for the whole gift (÷ giftCount per unit).
-// Set TANGO_AMOUNT_PER_GIFT=1 if a real sample shows amount is already per single gift.
+const TANGO_DEBUG           = process.env.TANGO_DEBUG !== '0';          // verbose Tango event logging
 const TANGO_AMOUNT_PER_GIFT = process.env.TANGO_AMOUNT_PER_GIFT === '1';
 
 // tiktok  → curated GIFT_POWER_MAP wins; raw diamond count is only a fallback
@@ -683,7 +684,39 @@ if (DEMO_MODE) {
 }
 
 // ============================================================
-// [9] SAFETY NET
+// [9] SYNTHETIC PLAYERS (BOTS)
+// ============================================================
+if (BOTS_ENABLED) {
+  const BOT_NAMES = ['ali_42', 'zeynep_x', 'mehmet_k', 'ayse_99', 'david_g', 'noa_l', 'itai_m', 'maya_s', 'olga_v', 'ivan_p', 'yuki_t', 'sara_j', 'kim_89', 'leo_w', 'nina_b', 'dimitri_k', 'can_y', 'ece_d', 'amir_h', 'sahar_n'];
+  const BOT_IDS = BOT_NAMES.map((_, i) => `bot_${i}`);
+  const BOT_GIFTS = [['Rose', 1], ['FingerHeart', 5], ['IceCreamCone', 10], ['Lion', 50], ['Universe', 100]];
+
+  console.log('🤖 BOTS enabled — synthetic players will join the game to keep it active');
+  
+  setInterval(() => {
+    if (!gameState.roundActive) return;
+    
+    const r = Math.random();
+    const botIdx = Math.floor(Math.random() * BOT_IDS.length);
+    const userId = BOT_IDS[botIdx];
+    const user = BOT_NAMES[botIdx];
+    
+    // 10% chance to join, 40% food, 25% drink, 25% gift
+    if (r < 0.10) {
+      onChat(userId, user, '!join');
+    } else if (r < 0.50) {
+      onChat(userId, user, '!food');
+    } else if (r < 0.75) {
+      onChat(userId, user, '!drink');
+    } else {
+      const [giftName, baseDiamonds] = rand(BOT_GIFTS);
+      onGift(userId, user, giftName, 1, baseDiamonds);
+    }
+  }, 2800);
+}
+
+// ============================================================
+// [10] SAFETY NET
 // ============================================================
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
 for (const sig of ['SIGTERM', 'SIGINT']) {
