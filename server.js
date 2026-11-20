@@ -29,11 +29,9 @@ const RULES = { finalPushMs: 30000, finalMult: 2, comebackRatio: 0.25, comebackM
 const BROADCAST_MIN_MS = 100;
 
 const TANGO_SIGNING_SECRET = process.env.TANGO_SIGNING_SECRET || '';
-const TANGO_MAX_SKEW_S     = 300;
 
-// ✅ NEW: how the numeric gift value should be interpreted per platform.
-//  - tiktok:  GIFT_POWER_MAP (curated) wins; raw diamond count is only a fallback.
-//  - tango / generic: the numeric value (diamonds) is authoritative.
+// tiktok  → curated GIFT_POWER_MAP wins; raw diamond count is only a fallback
+// tango / generic → the numeric value (diamonds) is authoritative
 const DEFAULT_USE_DIAMONDS = (PLATFORM === 'tango' || PLATFORM === 'generic');
 
 // ============================================================
@@ -82,10 +80,6 @@ const LOCAL_GIFTS = {
 const DEFAULT_GIFTS = ['🌹 Rose', '🫰 Finger Heart', '🍦 Ice Cream', '🦁 Lion', '🌌 Universe'];
 
 const splitSkin = (s) => { const i = s.indexOf(' '); return { icon: s.slice(0, i), name: s.slice(i + 1) }; };
-
-// ✅ CHANGED: tier is now derived from the numeric value (diamonds / power) only.
-// This makes skins consistent across platforms: 1 diamond → Rose tier,
-// 100 diamonds → Universe tier, regardless of gift name.
 const tierOf = (base) => base >= 100 ? 4 : base >= 50 ? 3 : base >= 10 ? 2 : base >= 5 ? 1 : 0;
 const skinFor = (country, base) => splitSkin((LOCAL_GIFTS[country] || DEFAULT_GIFTS)[tierOf(base)]);
 
@@ -224,12 +218,6 @@ function giftMult(team) {
   return m;
 }
 
-// ✅ CHANGED: gift() now supports two interpretations of the numeric `diamonds`
-// argument. When DEFAULT_USE_DIAMONDS is true (Tango / generic), the value is
-// treated as the authoritative power — GIFT_POWER_MAP is only a fallback for
-// curated demo names with no numeric value. When false (TikTok), the curated
-// GIFT_POWER_MAP stays authoritative and raw diamonds are only used for
-// unknown gifts.
 function gift(team, user, name, count = 1, diamonds = 0) {
   if (!gameState.roundActive) return;
   count = Math.min(999, Math.max(1, Math.floor(count) || 1));
@@ -338,12 +326,15 @@ const wss = new WebSocketServer({ server });
 app.disable('x-powered-by');
 
 if (PLATFORM === 'tango') {
-  app.use('/tango-hook', express.raw({ type: 'application/json', limit: '1mb' }));
+  // Keep raw buffer for HMAC verification
+  app.use('/tango-hook', express.raw({ type: '*/*', limit: '1mb' }));
+
+  // OPTIONS probe used by Tango to validate the URL
   app.use((req, res, next) => {
     if (req.method === 'OPTIONS' && req.path.startsWith('/tango-hook')) {
       return res
         .set('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        .set('Access-Control-Allow-Headers', 'Content-Type, TNG-Webhook-Signature')
+        .set('Access-Control-Allow-Headers', 'Content-Type, X-Tango-Signature')
         .sendStatus(200);
     }
     next();
@@ -475,26 +466,51 @@ if (EVENT_TOKEN) {
 
 // ---- Tango webhook adapter ----
 if (PLATFORM === 'tango') {
+
+  // Tango sends:  X-Tango-Signature: sha256=<lowercase hex HMAC-SHA256 of raw body>
+  // Some deployments may send just the hex without the "sha256=" prefix — handle both.
+  // The Stripe-style "t=..,v1=.." format is also accepted as a fallback for compatibility.
   function verifyTangoSignature(rawBody, signatureHeader, secret) {
-    if (!secret) return true;
+    if (!secret) return true;                        // dev only
     if (!signatureHeader) return false;
 
-    const parts = String(signatureHeader).split(',').map((s) => s.trim());
-    const t  = parts.find((p) => p.startsWith('t='))?.slice(2);
-    const v1 = parts.find((p) => p.startsWith('v1='))?.slice(3);
+    const header = String(signatureHeader).trim();
 
-    if (t) {
-      const now = Math.floor(Date.now() / 1000);
-      if (!Number.isFinite(Number(t)) || Math.abs(now - Number(t)) > TANGO_MAX_SKEW_S) return false;
+    // Extract the candidate hex digest
+    let candidate = null;
+
+    if (header.includes('=')) {
+      // Tango canonical: "sha256=<hex>"
+      const m = header.match(/^sha256=([0-9a-fA-F]+)$/);
+      if (m) candidate = m[1];
+    } else if (/^[0-9a-fA-F]+$/.test(header)) {
+      // Bare hex digest
+      candidate = header;
     }
 
-    const payload   = t ? `${t}.${rawBody}` : rawBody;
-    const candidate = v1 || signatureHeader;
-    const expected  = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+    // Fallback: Stripe-style "t=...,v1=..."
+    if (!candidate) {
+      const parts = header.split(',').map((s) => s.trim());
+      const v1 = parts.find((p) => p.startsWith('v1='))?.slice(3);
+      const t  = parts.find((p) => p.startsWith('t='))?.slice(2);
+      if (v1) {
+        const signed = t ? `${t}.${rawBody}` : rawBody;
+        candidate = v1;
+        try {
+          const expected = crypto.createHmac('sha256', secret).update(signed).digest('hex');
+          const a = Buffer.from(candidate, 'hex');
+          const b = Buffer.from(expected, 'hex');
+          return a.length === b.length && crypto.timingSafeEqual(a, b);
+        } catch { return false; }
+      }
+    }
 
+    if (!candidate) return false;
+
+    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
     try {
       const a = Buffer.from(candidate, 'hex');
-      const b = Buffer.from(expected,  'hex');
+      const b = Buffer.from(expected, 'hex');
       return a.length === b.length && crypto.timingSafeEqual(a, b);
     } catch { return false; }
   }
@@ -509,8 +525,6 @@ if (PLATFORM === 'tango') {
       return;
     }
 
-    // ✅ CHANGED: forward Tango's actual gift name / id and the diamond amount.
-    // Accepts either a single object or an array of gift receipts.
     if (evt.type === 'diamonds.received') {
       const items = Array.isArray(evt.data) ? evt.data : [evt.data];
       for (const d of items) {
@@ -525,10 +539,18 @@ if (PLATFORM === 'tango') {
   }
 
   function handleTangoWebhook(req, res) {
-    const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body || {});
-    const sig = req.get('TNG-Webhook-Signature') || req.get('X-Tango-Signature') || '';
+    const raw = Buffer.isBuffer(req.body)
+      ? req.body.toString('utf8')
+      : (typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {}));
+
+    const sig = req.get('X-Tango-Signature')
+             || req.get('TNG-Webhook-Signature')
+             || req.get('X-Tango-Signature-V1')
+             || '';
+
     if (!verifyTangoSignature(raw, sig, TANGO_SIGNING_SECRET)) {
-      console.warn('⚠️  Tango webhook signature verification failed');
+      console.warn('⚠️  Tango webhook signature verification failed',
+                   `(header="${String(sig).slice(0, 24)}…", bodyLen=${raw.length}, secretSet=${!!TANGO_SIGNING_SECRET})`);
       return res.sendStatus(401);
     }
 
@@ -545,7 +567,11 @@ if (PLATFORM === 'tango') {
   app.post('/tango-hook/:creatorId', handleTangoWebhook);
 
   console.log('🎛  Tango webhook adapter enabled — POST /tango-hook');
-  if (!TANGO_SIGNING_SECRET) console.warn('⚠️  TANGO_SIGNING_SECRET is not set — signatures will NOT be verified!');
+  if (!TANGO_SIGNING_SECRET) {
+    console.warn('⚠️  TANGO_SIGNING_SECRET is not set — signatures will NOT be verified!');
+  } else {
+    console.log(`🔐 Tango signature verification active (secret length ${TANGO_SIGNING_SECRET.length})`);
+  }
 }
 
 // ---- TikTok adapter ----
